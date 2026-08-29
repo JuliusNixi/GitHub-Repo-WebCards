@@ -12,35 +12,61 @@ var GHRepoCardsInit = (() => {
         
         const GITHUB_API_ENDPOINT = "https://api.github.com/";
 
+        // Repos per page asked to the GitHub's APIs (100 is the maximum allowed).
+        const PER_PAGE = 100;
+
+        // Maximum number of requests fired at the same time, to avoid the GitHub's
+        // APIs secondary rate limit, that is triggered by bursts of concurrent requests.
+        const CONCURRENCY = 5;
+
+        const EXPIRATION_HOURS = 1;
+
+        // Key prefix used to remember which repos compose the full list of an owner.
+        // '%' is not an admitted character in a GitHub's repo name, so it cannot collide.
+        const LIST_KEY_PREFIX = "%all:";
+
         // Null as arg to clear all.
         function clearDataLocal(repoName) {
-            if (repoName === undefined || typeof repoName != "string")
+            if (repoName !== null && typeof repoName != "string")
                 throw new Error(`GitHub-Repos-WebCards: Error in clearDataLocal(). Invalid arg received.`);
-            let l = localStorage.length;
-            for (let i = 0; i < l; i++) {
-                const key = localStorage.key(i);
+            const wanted = repoName === null ? null : repoName.toLowerCase();
+            // The keys are collected before removing anything, otherwise removing an item
+            // while looping on the localStorage indexes shifts them and skips some entries.
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++)
+                keys.push(localStorage.key(i));
+            for (const key of keys) {
                 const value = localStorage.getItem(key);
+                if (value === null) continue;
+                let parsedValue;
                 try {
-                    const parsedValue = JSON.parse(value);
-                    if (parsedValue && typeof parsedValue === 'object')
-                        if (parsedValue.expiry && parsedValue.repoData && (repoName === null || repoName === parsedValue.repoData.name))
-                            localStorage.removeItem(key);
+                    parsedValue = JSON.parse(value);
                 } catch (error) {
-                    localStorage.removeItem(key);
-                    throw new Error(`GitHub-Repos-WebCards: Error in clearDataLocal(): ${error}.`);
+                    // Not written by this script, so it must be left untouched.
+                    continue;
+                }
+                if (!parsedValue || typeof parsedValue !== 'object') continue;
+                if (parsedValue.expiry && parsedValue.repoData) {
+                    if (wanted === null || wanted === String(parsedValue.repoData.name).toLowerCase())
+                        localStorage.removeItem(key);
+                    continue;
+                }
+                // Owners's full repos lists.
+                if (key.startsWith(LIST_KEY_PREFIX) && Array.isArray(parsedValue.repoNames)) {
+                    if (wanted === null || parsedValue.repoNames.includes(wanted))
+                        localStorage.removeItem(key);
                 }
             }
         }
         
         function saveDataLocal(repoData) {
-            if (repoData === undefined || typeof repoData != "object")
+            if (repoData === undefined || repoData === null || typeof repoData != "object")
                 throw new Error(`GitHub-Repos-WebCards: Error in saveDataLocal(). Invalid arg received.`);
             if (!ENABLE_CACHING) return;
             const now = new Date();
-            let expirationHours = 1;
             const item = {
                 repoData: repoData,
-                expiry: now.getTime() + (expirationHours * 60 * 60 * 1000)
+                expiry: now.getTime() + (EXPIRATION_HOURS * 60 * 60 * 1000)
             };
             let key = repoData.name.toLowerCase();
             localStorage.setItem(key, JSON.stringify(item));
@@ -49,26 +75,86 @@ var GHRepoCardsInit = (() => {
         function getDataLocal() {
             const items = {};
             if (!ENABLE_CACHING) return items;
-            let l = localStorage.length;
-            for (let i = 0; i < l; i++) {
-                const key = localStorage.key(i);
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++)
+                keys.push(localStorage.key(i));
+            for (const key of keys) {
                 const value = localStorage.getItem(key);
+                if (value === null) continue;
+                let parsedValue;
                 try {
-                    const parsedValue = JSON.parse(value);
-                    if (parsedValue && typeof parsedValue === 'object' && parsedValue.expiry && parsedValue.repoData) {
-                        const now = new Date();
-                        if (now.getTime() > parsedValue.expiry) {
-                            localStorage.removeItem(key);
-                            continue;
-                        }
-                        items[key] = parsedValue;
-                    }
+                    parsedValue = JSON.parse(value);
                 } catch (error) {
-                    localStorage.removeItem(key);
-                    throw new Error(`GitHub-Repos-WebCards: Error in getDataLocal(): ${error}.`);
+                    // Not written by this script, so it must be left untouched.
+                    continue;
+                }
+                if (parsedValue && typeof parsedValue === 'object' && parsedValue.expiry && parsedValue.repoData) {
+                    const now = new Date();
+                    if (now.getTime() > parsedValue.expiry) {
+                        localStorage.removeItem(key);
+                        continue;
+                    }
+                    items[key] = parsedValue;
                 }
             }
             return items;
+        }
+
+        // An owner's repos list is cached apart from the single repos, so that a download
+        // interrupted halfway (a rate limit hit, for example) is not mistaken for a complete one.
+        function saveListLocal(userString, repoNames) {
+            if (!ENABLE_CACHING) return;
+            const now = new Date();
+            localStorage.setItem(LIST_KEY_PREFIX + userString, JSON.stringify({
+                repoNames: repoNames,
+                expiry: now.getTime() + (EXPIRATION_HOURS * 60 * 60 * 1000)
+            }));
+        }
+
+        function getListLocal(userString) {
+            if (!ENABLE_CACHING) return null;
+            const key = LIST_KEY_PREFIX + userString;
+            const value = localStorage.getItem(key);
+            if (value === null) return null;
+            try {
+                const parsedValue = JSON.parse(value);
+                if (!parsedValue || !Array.isArray(parsedValue.repoNames) || !parsedValue.expiry) return null;
+                if (new Date().getTime() > parsedValue.expiry) {
+                    localStorage.removeItem(key);
+                    return null;
+                }
+                return parsedValue.repoNames;
+            } catch (error) {
+                localStorage.removeItem(key);
+                return null;
+            }
+        }
+
+        // Only the data actually present in the card's html structure are downloaded,
+        // every useless request is a request stolen from the hourly rate limit.
+        function neededFields(cardDiv) {
+            return {
+                languages: cardDiv.querySelector(".gh-repos-cards-languages") !== null,
+                watchers: cardDiv.querySelector(".gh-repos-cards-watchers") !== null
+            };
+        }
+
+        function cachedEntryIsUsable(entry, userString, fields) {
+            if (!entry || !entry.repoData || !entry.repoData.owner) return false;
+            // Two different owners could have a repo with the same name.
+            if (String(entry.repoData.owner.login).toLowerCase() !== userString) return false;
+            if (fields.languages && entry.repoData.repoLanguages === undefined) return false;
+            if (fields.watchers && entry.repoData.repoWatchers === undefined) return false;
+            return true;
+        }
+
+        async function mapWithLimit(items, mapper) {
+            const results = [];
+            for (let i = 0; i < items.length; i += CONCURRENCY) {
+                const chunk = items.slice(i, i + CONCURRENCY);
+                results.push(...await Promise.all(chunk.map(mapper)));
+            }
+            return results;
         }
         
         function putData(repoData, cardDiv) {
@@ -113,71 +199,123 @@ var GHRepoCardsInit = (() => {
             });
         
             appendTextContent(".gh-repos-cards-stars", String(repoData.repoStars));
-            appendTextContent(".gh-repos-cards-watchers", String(repoData.repoWatchers));
+            if (repoData.repoWatchers !== undefined && repoData.repoWatchers !== null)
+                appendTextContent(".gh-repos-cards-watchers", String(repoData.repoWatchers));
             appendTextContent(".gh-repos-cards-updatedat", repoData.repoUpdatedAt);
             appendTextContent(".gh-repos-cards-forks", String(repoData.repoForks));
         }
-        
-        async function getData(query) {
-            try {
-                const response = await fetch(GITHUB_API_ENDPOINT + query, GITHUB_API_SETTINGS);
-                if (!response.ok) {
-                    throw new Error(`GitHub-Repos-WebCards: GitHub API request error! Status: ${response.status}.`);
+
+        function apiErrorMessage(query, response) {
+            const remaining = response.headers.get("X-RateLimit-Remaining");
+            if ((response.status === 403 || response.status === 429) && remaining === "0") {
+                const reset = Number(response.headers.get("X-RateLimit-Reset"));
+                let when = "";
+                if (Number.isFinite(reset) && reset > 0) {
+                    const resetDate = new Date(reset * 1000);
+                    const minutes = Math.max(1, Math.ceil((resetDate.getTime() - new Date().getTime()) / 60000));
+                    when = ` It will be reset at ${resetDate.toLocaleTimeString()} (about ${minutes} minute(s) from now).`;
                 }
-                return await response.json();
-            } catch (error) {
-                throw new Error(`GitHub-Repos-WebCards: Error in getData(): ${error}.`);
-            } 
+                return `GitHub-Repos-WebCards: GitHub's APIs rate limit exceeded on '${query}'. ` +
+                       `Unauthenticated requests are limited to 60/hour per public IP.${when} ` +
+                       `Keep the cache enabled with GHRepoCardsInit(true) and reduce the number of ` +
+                       `<gh-repos-cards> tags and of the requested data fields.`;
+            }
+            return `GitHub-Repos-WebCards: GitHub's APIs request error on '${query}'! Status: ${response.status}.`;
         }
         
-        async function getAllRepos(userString, sortString) {
+        async function getData(query) {
+            let response;
+            try {
+                response = await fetch(GITHUB_API_ENDPOINT + query, GITHUB_API_SETTINGS);
+            } catch (error) {
+                throw new Error(`GitHub-Repos-WebCards: Network error in getData() on '${query}': ${error.message}.`);
+            }
+            if (!response.ok)
+                throw new Error(apiErrorMessage(query, response));
+            return await response.json();
+        }
+        
+        async function getAllRepos(userString, sortString, fields) {
 
             if (userString === undefined || sortString === undefined)
                 throw new Error(`GitHub-Repos-WebCards: Error in getAllRepos(). Invalid args received.`);
 
+            fields = fields || { languages: true, watchers: true };
+
+            if (ENABLE_CACHING) {
+                const cachedNames = getListLocal(userString);
+                if (cachedNames) {
+                    const localRepos = getDataLocal();
+                    const userRepos = {};
+                    let complete = true;
+                    for (const name of cachedNames) {
+                        if (!cachedEntryIsUsable(localRepos[name], userString, fields)) {
+                            complete = false;
+                            break;
+                        }
+                        userRepos[name] = localRepos[name];
+                    }
+                    // A partial cache is not served, otherwise a download interrupted by an
+                    // error would keep showing an incomplete list until its expiration.
+                    if (complete) {
+                        userRepos["%reDownloaded"] = false;
+                        return userRepos;
+                    }
+                }
+            }
+
             let allRepos = [];
             let page = 1;
 
-            if (ENABLE_CACHING) {
-                const localRepos = getDataLocal();
-                const reDownload = !Object.values(localRepos).some(repo => repo.repoData.owner.login.toLowerCase() === userString);
-                if (!reDownload){
-                    const toRemoveKeys = Object.keys(localRepos).map(e => localRepos[e].repoData).filter(e => e.owner.login.toLowerCase() === userString);
-                    toRemoveKeys.forEach(key => delete localRepos[key.name]);
-                    localRepos["%reDownloaded"] = false;
-                    return localRepos;
-                } 
-            }
+            // Even when the cached list is incomplete, the repos already saved in it are
+            // reused, so a download retried after an error doesn't start again from zero.
+            const alreadyCached = ENABLE_CACHING ? getDataLocal() : {};
 
             while (true) {
-                let repos = await getData(`users/${userString}/repos?per_page=100&page=${page}${sortString}`);
+                let repos = await getData(`users/${userString}/repos?per_page=${PER_PAGE}&page=${page}${sortString}`);
                 if (repos.length === 0) break;
-                
-                const repoPromises = repos.map(async (repo) => {
-                    const [topics, languages, watchers] = await Promise.all([
-                        getData(`repos/${userString}/${repo.name}/topics`),
-                        getData(`repos/${userString}/${repo.name}/languages`),
-                        getData(`repos/${userString}/${repo.name}/subscribers`)
+
+                const pageRepos = await mapWithLimit(repos, async (repo) => {
+                    const cached = alreadyCached[repo.name.toLowerCase()];
+                    if (cachedEntryIsUsable(cached, userString, fields)) return cached.repoData;
+
+                    // 'topics' is already included in this response, no request needed for it.
+                    // 'subscribers_count' (the real watchers count) is not, it only exists in the
+                    // single repo's response, so it costs one more request and it's asked
+                    // only if the card really shows it.
+                    const [languages, fullRepo] = await Promise.all([
+                        fields.languages ? getData(`repos/${userString}/${repo.name}/languages`) : Promise.resolve(undefined),
+                        fields.watchers ? getData(`repos/${userString}/${repo.name}`) : Promise.resolve(undefined)
                     ]);
-        
-                    return {
+
+                    const repoData = {
                         ...repo,
                         repoStars: repo.stargazers_count,
                         repoUpdatedAt: repo.updated_at,
                         repoForks: repo.forks_count,
-                        repoTopics: topics && topics.names ? topics.names : [],
-                        repoLanguages: languages || {},
-                        repoWatchers: watchers.length
+                        repoTopics: Array.isArray(repo.topics) ? repo.topics : [],
+                        repoLanguages: fields.languages ? (languages || {}) : undefined,
+                        repoWatchers: fields.watchers ? fullRepo.subscribers_count : undefined
                     };
+
+                    // Saved as soon as it's downloaded: if a following repo fails, what has
+                    // been already downloaded is not lost and it's not downloaded again.
+                    saveDataLocal(repoData);
+                    return repoData;
                 });
-        
-                allRepos.push(...await Promise.all(repoPromises));
+
+                allRepos.push(...pageRepos);
+                // The last page is shorter than the asked size, so asking for the next one
+                // would only be a wasted request.
+                if (repos.length < PER_PAGE) break;
                 page++;
             }
+
+            saveListLocal(userString, allRepos.map(e => e.name.toLowerCase()));
         
             let objAllRepos = {};
             allRepos.forEach((e) => {
-                objAllRepos[e.name] = {
+                objAllRepos[e.name.toLowerCase()] = {
                     repoData: e,
                     expiry: 1
                 }
@@ -186,32 +324,35 @@ var GHRepoCardsInit = (() => {
             return objAllRepos;
         }
         
-        async function getSingleRepo(userString, repoString) {
+        async function getSingleRepo(userString, repoString, fields) {
+
+            if (userString === undefined || repoString === undefined)
+                throw new Error(`GitHub-Repos-WebCards: Error in getSingleRepo(). Invalid args received.`);
+
+            fields = fields || { languages: true, watchers: true };
 
             if (ENABLE_CACHING) {
                 let localRepos = getDataLocal();
                 let localRepo = localRepos[repoString];
-                if (localRepo != undefined) {
+                if (cachedEntryIsUsable(localRepo, userString, fields)) {
                     localRepo["%reDownloaded"] = false;
                     return localRepo;
                 } 
             }
-        
-            const [repo, topics, languages, watchers] = await Promise.all([
-                getData(`repos/${userString}/${repoString}`),
-                getData(`repos/${userString}/${repoString}/topics`),
-                getData(`repos/${userString}/${repoString}/languages`),
-                getData(`repos/${userString}/${repoString}/subscribers`)
-            ]);
+
+            // The single repo's response already contains 'topics' and 'subscribers_count',
+            // so only the languages may need one more request.
+            const repo = await getData(`repos/${userString}/${repoString}`);
+            const languages = fields.languages ? await getData(`repos/${userString}/${repoString}/languages`) : undefined;
     
             let repoData = {
                 ...repo,
                 repoStars: repo.stargazers_count,
                 repoUpdatedAt: repo.updated_at,
                 repoForks: repo.forks_count,
-                repoTopics: topics && topics.names ? topics.names : [],
-                repoLanguages: languages || {},
-                repoWatchers: watchers.length
+                repoTopics: Array.isArray(repo.topics) ? repo.topics : [],
+                repoLanguages: fields.languages ? (languages || {}) : undefined,
+                repoWatchers: repo.subscribers_count
             };
                 
             return {
@@ -222,6 +363,10 @@ var GHRepoCardsInit = (() => {
         }
 
         // processGHRepoCards() function start.
+
+        // With the cache disabled a previously setted cache must not be left behind.
+        if (!ENABLE_CACHING) clearDataLocal(null);
+
         let cardsElements = [...document.getElementsByTagName("gh-repos-cards")];
 
         if (cardsElements.length == 0) {
@@ -238,6 +383,8 @@ var GHRepoCardsInit = (() => {
             return repoA.localeCompare(repoB);
         });
 
+        const errors = [];
+
         for (let cardTag of cardsElements) {
             const userString = cardTag.getAttribute("data-user")?.toLowerCase();
             const repoString = cardTag.getAttribute("data-repo")?.toLowerCase();
@@ -253,54 +400,65 @@ var GHRepoCardsInit = (() => {
             }
             cardDiv = cardDiv[0];
 
-            if (repoString === "%all") {
-                // All repos.
-                const reposort = cardTag.getAttribute("data-sort")?.toLowerCase();
-                const directionsort = cardTag.getAttribute("data-direction")?.toLocaleLowerCase();
-                let sortString = "";
+            const fields = neededFields(cardDiv);
 
-                if (reposort) {
-                    const admittedsort = ['created', 'updated', 'pushed', 'full_name'];
-                    const admitteddirection = ['asc', 'desc'];
-                    
-                    if (!admittedsort.includes(reposort))
-                        throw new Error(`GitHub-Repos-WebCards: Invalid 'data-sort' attribute. Must be one of: ${admittedsort.join(', ')}.`);
-                    if (directionsort && !admitteddirection.includes(directionsort))
-                        throw new Error(`GitHub-Repos-WebCards: Invalid 'data-direction' attribute. Must be one of: ${admitteddirection.join(', ')}.`);
+            // Each card is downloaded independently: a card failing (a network problem or the
+            // GitHub's APIs rate limit, for example) must not leave all the other ones empty.
+            try {
 
-                    sortString = `&sort=${reposort}&direction=${directionsort}`;
+                if (repoString === "%all") {
+                    // All repos.
+                    const reposort = cardTag.getAttribute("data-sort")?.toLowerCase();
+                    const directionsort = cardTag.getAttribute("data-direction")?.toLocaleLowerCase();
+                    let sortString = "";
+
+                    if (reposort) {
+                        const admittedsort = ['created', 'updated', 'pushed', 'full_name'];
+                        const admitteddirection = ['asc', 'desc'];
+                        
+                        if (!admittedsort.includes(reposort))
+                            throw new Error(`GitHub-Repos-WebCards: Invalid 'data-sort' attribute. Must be one of: ${admittedsort.join(', ')}.`);
+                        if (directionsort && !admitteddirection.includes(directionsort))
+                            throw new Error(`GitHub-Repos-WebCards: Invalid 'data-direction' attribute. Must be one of: ${admitteddirection.join(', ')}.`);
+
+                        sortString = `&sort=${reposort}&direction=${directionsort}`;
+                    }
+
+                    let repos = await getAllRepos(userString, sortString, fields);
+                    delete repos["%reDownloaded"];
+
+                    const originalContent = cardDiv.innerHTML;
+
+                    Object.values(repos).map(e => e.repoData).forEach((repoFromList, index) => {
+                        const newCardDiv = cardDiv.cloneNode(true);
+                        newCardDiv.innerHTML = originalContent;
+                        putData(repoFromList, newCardDiv);
+                        
+                        if (index === 0) {
+                            cardDiv.innerHTML = newCardDiv.innerHTML;
+                        } else {
+                            cardTag.appendChild(newCardDiv);
+                        }
+                    });
+
+                } else {
+                    // Single repo.
+                    const repoData = await getSingleRepo(userString, repoString, fields);
+                    const reDownloaded = repoData["%reDownloaded"];
+                    delete repoData["%reDownloaded"];
+                    if (reDownloaded)
+                        saveDataLocal(repoData.repoData);
+                    putData(repoData.repoData, cardDiv);
                 }
 
-                let repos = await getAllRepos(userString, sortString);
-                let reDownload = repos["%reDownloaded"];
-                delete repos["%reDownloaded"];
-                if (reDownload) Object.values(repos).forEach((e) => saveDataLocal(e.repoData));
+                cardTag.style = "";
 
-                const originalContent = cardDiv.innerHTML;
-
-                Object.values(repos).map(e => e.repoData).forEach((repoFromList, index) => {
-                    const newCardDiv = cardDiv.cloneNode(true);
-                    newCardDiv.innerHTML = originalContent;
-                    putData(repoFromList, newCardDiv);
-                    
-                    if (index === 0) {
-                        cardDiv.innerHTML = newCardDiv.innerHTML;
-                    } else {
-                        cardTag.appendChild(newCardDiv);
-                    }
-                });
-
-            } else {
-                // Single repo.
-                const repoData = await getSingleRepo(userString, repoString);
-                const reDownloaded = repoData["%reDownloaded"];
-                delete repoData["%reDownloaded"];
-                if (reDownloaded)
-                    saveDataLocal(repoData.repoData);
-                putData(repoData.repoData, cardDiv);
+            } catch (error) {
+                // The tag is left hidden, an half filled card is worse than no card at all.
+                errors.push(error);
+                console.error(`GitHub-Repos-WebCards: the card '${userString}/${repoString}' has not been filled. ${error.message}`);
             }
 
-            cardTag.style = "";
         }
 
         // Export functions to call it directly outside if needed, basic APIs.
@@ -311,6 +469,8 @@ var GHRepoCardsInit = (() => {
         processGHRepoCards.getData = getData;
         processGHRepoCards.getAllRepos = getAllRepos;
         processGHRepoCards.getSingleRepo = getSingleRepo;
+        // The errors of the cards that could not be filled, empty array if all went fine.
+        processGHRepoCards.errors = errors;
 
         return processGHRepoCards;
 
@@ -344,4 +504,3 @@ var GHRepoCardsInit = (() => {
     };
 
 })()();
-
