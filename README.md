@@ -32,7 +32,7 @@ Two possibility:
 * Download the javascript vanilla script from here to serve it with your site's assets, so you are independent.
 * Serve it through a CDN in this way (thanks to [jsDelivr](https://www.jsdelivr.com)):
 ```html
-<script src="https://cdn.jsdelivr.net/gh/juliusnixi/GitHub-Repos-WebCards@2.0.1/ghreposcards.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/juliusnixi/GitHub-Repos-WebCards@2.1.0/ghreposcards.js"></script>
 ```
 
 ## Setup
